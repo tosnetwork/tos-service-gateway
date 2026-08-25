@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
@@ -89,9 +88,8 @@ func readPrivate(path string, maximum int64) ([]byte, error) {
 		return nil, errors.New("provider Quote file path must be absolute and clean")
 	}
 	before, err := os.Lstat(path)
-	stat, ok := fileOwner(before)
-	if err != nil || !ok || !before.Mode().IsRegular() || before.Mode().Perm() != 0600 ||
-		stat.Uid != uint32(os.Geteuid()) || before.Size() <= 0 || before.Size() > maximum {
+	if err != nil || !fileOwner(before) || !before.Mode().IsRegular() || before.Mode().Perm() != 0600 ||
+		before.Size() <= 0 || before.Size() > maximum {
 		return nil, errors.New("provider Quote file must be an owner-only bounded regular file")
 	}
 	file, err := os.Open(path)
@@ -108,12 +106,4 @@ func readPrivate(path string, maximum int64) ([]byte, error) {
 		return nil, errors.New("provider Quote file exceeds bound")
 	}
 	return raw, nil
-}
-
-func fileOwner(info os.FileInfo) (*syscall.Stat_t, bool) {
-	if info == nil {
-		return nil, false
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	return stat, ok
 }

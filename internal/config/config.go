@@ -2,6 +2,8 @@
 package config
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"net/url"
 	"os"
@@ -30,7 +32,16 @@ type Config struct {
 	NativeRelayToken string
 	TOSRPC           TOSRPCConfig
 	Catalog          CatalogConfig
+	IntentCarrier    IntentCarrierConfig
 	QuoteProfileFile string
+}
+
+type IntentCarrierConfig struct {
+	Directory       string
+	CarrierID       string
+	MaxEntries      uint32
+	MaxActorEntries uint32
+	AuthorityPins   map[string]ed25519.PublicKey
 }
 
 type CatalogConfig struct {
@@ -55,6 +66,14 @@ func Load() (Config, error) {
 	if err != nil || maxCatalogEntries <= 0 {
 		return Config{}, errors.New("TOS_SERVICE_CAPABILITY_CATALOG_MAX_ENTRIES must be a positive integer")
 	}
+	maxIntentEntries, err := intEnv("TOS_SERVICE_INTENT_CARRIER_MAX_ENTRIES", 100_000)
+	if err != nil || maxIntentEntries <= 0 || maxIntentEntries > 1_000_000 {
+		return Config{}, errors.New("TOS_SERVICE_INTENT_CARRIER_MAX_ENTRIES must be between 1 and 1000000")
+	}
+	maxActorIntentEntries, err := intEnv("TOS_SERVICE_INTENT_CARRIER_MAX_ACTOR_ENTRIES", 1_000)
+	if err != nil || maxActorIntentEntries <= 0 || maxActorIntentEntries > maxIntentEntries {
+		return Config{}, errors.New("TOS_SERVICE_INTENT_CARRIER_MAX_ACTOR_ENTRIES must be positive and no greater than the Carrier capacity")
+	}
 	insecure, err := boolEnv("TOS_SERVICE_TOS_RPC_INSECURE", false)
 	if err != nil {
 		return Config{}, err
@@ -75,7 +94,14 @@ func Load() (Config, error) {
 			GenesisRootHash:  strings.TrimSpace(os.Getenv("TOS_SERVICE_GENESIS_ROOT_HASH")),
 			GenesisFileHash:  strings.TrimSpace(os.Getenv("TOS_SERVICE_GENESIS_FILE_HASH")),
 			RegistryCodeHash: strings.TrimSpace(os.Getenv("TOS_SERVICE_REGISTRY_CODE_HASH")), MaxEntries: uint32(maxCatalogEntries)},
+		IntentCarrier: IntentCarrierConfig{Directory: strings.TrimSpace(os.Getenv("TOS_SERVICE_INTENT_CARRIER_DIRECTORY")),
+			CarrierID: strings.TrimSpace(os.Getenv("TOS_SERVICE_INTENT_CARRIER_ID")), MaxEntries: uint32(maxIntentEntries),
+			MaxActorEntries: uint32(maxActorIntentEntries)},
 		QuoteProfileFile: strings.TrimSpace(os.Getenv("TOS_SERVICE_PROVIDER_QUOTE_PROFILE_FILE")),
+	}
+	cfg.IntentCarrier.AuthorityPins, err = parseAuthorityPins(os.Getenv("TOS_SERVICE_INTENT_AUTHORITY_PINS"))
+	if err != nil {
+		return Config{}, err
 	}
 	return cfg, cfg.Validate()
 }
@@ -125,10 +151,45 @@ func (c Config) Validate() error {
 	if c.Catalog.MaxEntries == 0 || c.Catalog.MaxEntries > 1_000_000 {
 		return errors.New("Capability catalog entry bound is invalid")
 	}
+	if c.IntentCarrier.Directory != "" {
+		if !filepath.IsAbs(c.IntentCarrier.Directory) || filepath.Clean(c.IntentCarrier.Directory) != c.IntentCarrier.Directory {
+			return errors.New("TOS_SERVICE_INTENT_CARRIER_DIRECTORY must be absolute and clean")
+		}
+		if c.IntentCarrier.CarrierID == "" || c.IntentCarrier.MaxEntries == 0 || c.IntentCarrier.MaxEntries > 1_000_000 ||
+			c.IntentCarrier.MaxActorEntries == 0 || c.IntentCarrier.MaxActorEntries > c.IntentCarrier.MaxEntries || len(c.IntentCarrier.AuthorityPins) == 0 {
+			return errors.New("enabled Intent Carrier requires a bounded ID and capacity")
+		}
+	} else if c.IntentCarrier.CarrierID != "" {
+		return errors.New("TOS_SERVICE_INTENT_CARRIER_ID requires an Intent Carrier directory")
+	}
 	if c.QuoteProfileFile != "" && (!filepath.IsAbs(c.QuoteProfileFile) || filepath.Clean(c.QuoteProfileFile) != c.QuoteProfileFile) {
 		return errors.New("TOS_SERVICE_PROVIDER_QUOTE_PROFILE_FILE must be absolute and clean")
 	}
 	return nil
+}
+
+// parseAuthorityPins accepts a comma-separated authority-id=ed25519:<hex>
+// list. Pins are explicit deployment authority, not trust-on-first-use state.
+func parseAuthorityPins(value string) (map[string]ed25519.PublicKey, error) {
+	pins := make(map[string]ed25519.PublicKey)
+	if strings.TrimSpace(value) == "" {
+		return pins, nil
+	}
+	for _, item := range strings.Split(value, ",") {
+		parts := strings.SplitN(strings.TrimSpace(item), "=", 2)
+		if len(parts) != 2 || parts[0] == "" || !strings.HasPrefix(parts[1], "ed25519:") {
+			return nil, errors.New("TOS_SERVICE_INTENT_AUTHORITY_PINS is invalid")
+		}
+		raw, err := hex.DecodeString(strings.TrimPrefix(parts[1], "ed25519:"))
+		if err != nil || len(raw) != ed25519.PublicKeySize {
+			return nil, errors.New("TOS_SERVICE_INTENT_AUTHORITY_PINS contains an invalid key")
+		}
+		if _, duplicate := pins[parts[0]]; duplicate {
+			return nil, errors.New("TOS_SERVICE_INTENT_AUTHORITY_PINS contains a duplicate authority")
+		}
+		pins[parts[0]] = ed25519.PublicKey(append([]byte(nil), raw...))
+	}
+	return pins, nil
 }
 
 func envOr(name, fallback string) string {

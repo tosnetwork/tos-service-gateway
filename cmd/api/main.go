@@ -15,6 +15,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/tosnetwork/tos-service-gateway/internal/adapters/serviceprotocol"
 	"github.com/tosnetwork/tos-service-gateway/internal/config"
+	"github.com/tosnetwork/tos-service-gateway/internal/intentcarrier"
 	"github.com/tosnetwork/tos-service-gateway/internal/nativegateway"
 	"github.com/tosnetwork/tos-service-gateway/internal/quotesource"
 	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
@@ -84,6 +85,20 @@ func main() {
 	mux.Handle(dnsPath, dnsHandler)
 	discoveryPath, discoveryHandler := tosservicev1connect.NewCapabilityDiscoveryServiceHandler(gateway)
 	mux.Handle(discoveryPath, discoveryHandler)
+	if cfg.IntentCarrier.Directory != "" {
+		carrier, carrierErr := intentcarrier.Open(cfg.IntentCarrier.Directory, cfg.IntentCarrier.CarrierID, cfg.IntentCarrier.MaxEntries,
+			cfg.IntentCarrier.MaxActorEntries,
+			intentcarrier.PinnedAuthorities(cfg.IntentCarrier.AuthorityPins))
+		if carrierErr != nil {
+			logger.Error("configure Intent Carrier", "error", carrierErr)
+			os.Exit(2)
+		}
+		defer carrier.Close()
+		intentHandler := intentcarrier.Handler(carrier, intentCarrierAuthorizer{gateway.Authorizer})
+		mux.Handle("/v1/intents", intentHandler)
+		mux.Handle("/v1/intents/", intentHandler)
+		mux.Handle("/v1/intent-actions/", intentHandler)
+	}
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", readinessHandler(backend, cfg.TOSRPC.Timeout))
 	mux.HandleFunc("GET /.well-known/tos-service.json", gatewayDiscoveryHandler(cfg, time.Now))
@@ -135,6 +150,7 @@ type gatewayDiscoveryNetwork struct {
 type gatewayDiscoveryServices struct {
 	NativeConnect string `json:"native_connect"`
 	DNSConnect    string `json:"dns_alias_connect"`
+	IntentHTTP    string `json:"intent_http,omitempty"`
 }
 type gatewayDiscoveryLimits struct {
 	MaxRequestBytes  int `json:"max_request_bytes"`
@@ -145,13 +161,34 @@ func gatewayDiscoveryHandler(cfg config.Config, now func() time.Time) http.Handl
 	return func(w http.ResponseWriter, _ *http.Request) {
 		document := gatewayDiscoveryDocument{Schema: "tos.service.gateway-discovery.v1", Protocol: "tos_service_v1",
 			Network:          gatewayDiscoveryNetwork{cfg.Catalog.NetworkID, cfg.Catalog.GenesisRootHash, cfg.Catalog.GenesisFileHash},
-			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{cfg.PublicBaseURL, cfg.PublicBaseURL},
+			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{NativeConnect: cfg.PublicBaseURL, DNSConnect: cfg.PublicBaseURL,
+				IntentHTTP: intentServiceURL(cfg)},
 			Limits:    gatewayDiscoveryLimits{MaxRequestBytes: 1 << 20, MaxResponseBytes: cfg.TOSRPC.MaxMessageBytes},
 			ExpiresAt: now().Add(time.Hour).Unix()}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		_ = json.NewEncoder(w).Encode(document)
 	}
+}
+
+func intentServiceURL(cfg config.Config) string {
+	if cfg.IntentCarrier.Directory == "" {
+		return ""
+	}
+	return cfg.PublicBaseURL + "/v1/intents"
+}
+
+type intentCarrierAuthorizer struct{ authorizer nativegateway.Authorizer }
+
+func (authorizer intentCarrierAuthorizer) Authorize(header string, write bool) error {
+	permission := nativegateway.PermissionRead
+	if write {
+		permission = nativegateway.PermissionRelay
+	}
+	if authorizer.authorizer == nil {
+		return errors.New("Intent Carrier authorization is unavailable")
+	}
+	return authorizer.authorizer.Authorize(header, permission)
 }
 
 type catalogBackend struct{ client *toprotocol.Client }
