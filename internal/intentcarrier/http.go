@@ -17,6 +17,119 @@ type HTTPAuthorizer interface{ Authorize(string, bool) error }
 
 func Handler(store *Store, authorize HTTPAuthorizer) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/operations/admission-challenge", func(writer http.ResponseWriter, request *http.Request) {
+		if authorize == nil || authorize.Authorize(request.Header.Get("Authorization"), true) != nil {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		declared, err := strconv.ParseUint(request.URL.Query().Get("declared_bytes"), 10, 64)
+		if err != nil {
+			http.Error(writer, "invalid declared_bytes", http.StatusBadRequest)
+			return
+		}
+		challenge, err := store.IssueAdmissionFor("operation.publish", request.URL.Query().Get("actor_id"), request.URL.Query().Get("audience"), declared)
+		if err != nil {
+			writeOutcomeHTTPError(writer, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(writer, http.StatusCreated, challenge)
+	})
+	mux.HandleFunc("POST /v1/operations", func(writer http.ResponseWriter, request *http.Request) {
+		if authorize == nil || authorize.Authorize(request.Header.Get("Authorization"), true) != nil {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		request.Body = http.MaxBytesReader(writer, request.Body, MaxStoredIntentBytes+(256<<10))
+		decoder := json.NewDecoder(request.Body)
+		decoder.DisallowUnknownFields()
+		var input struct {
+			Submission commerce.OperationCarrierSubmissionV1 `json:"submission"`
+			Admission  commerce.OperationAdmissionProof      `json:"admission"`
+		}
+		if decoder.Decode(&input) != nil || requireJSONEOF(decoder) != nil {
+			http.Error(writer, "invalid admitted operation", http.StatusBadRequest)
+			return
+		}
+		result, resolution, err := store.PublishOutcomeAdmitted(input.Submission.Request, input.Admission, input.Submission.AuthorizedAction, input.Submission.WriterFence)
+		if err != nil {
+			writeOutcomeHTTPError(writer, http.StatusConflict, err)
+			return
+		}
+		writeJSON(writer, http.StatusCreated, struct {
+			Result     OutcomeResult             `json:"result"`
+			Resolution commerce.ActionResolution `json:"action_resolution"`
+		}{result, resolution})
+	})
+	mux.HandleFunc("GET /v1/operations/{digest}", func(writer http.ResponseWriter, request *http.Request) {
+		if authorize == nil || authorize.Authorize(request.Header.Get("Authorization"), false) != nil {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		result, err := store.GetOutcome("sha256:" + request.PathValue("digest"))
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(writer, "not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			writeOutcomeHTTPError(writer, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /v1/operation-actions/{action}", func(writer http.ResponseWriter, request *http.Request) {
+		if authorize == nil || authorize.Authorize(request.Header.Get("Authorization"), true) != nil {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		resolution, err := store.ResolveOutcomeAction("sha256:"+request.PathValue("action"), request.URL.Query().Get("request_digest"))
+		if err != nil {
+			writeOutcomeHTTPError(writer, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, resolution)
+	})
+	mux.HandleFunc("GET /v1/operations", func(writer http.ResponseWriter, request *http.Request) {
+		if authorize == nil || authorize.Authorize(request.Header.Get("Authorization"), false) != nil {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		query, err := parseOutcomeQuery(request)
+		if err != nil {
+			writeOutcomeHTTPError(writer, http.StatusBadRequest, err)
+			return
+		}
+		page, err := store.SearchOutcomes(query)
+		if err != nil {
+			writeOutcomeHTTPError(writer, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, page)
+	})
+	mux.HandleFunc("GET /v1/operations/subscribe", func(writer http.ResponseWriter, request *http.Request) {
+		if authorize == nil || authorize.Authorize(request.Header.Get("Authorization"), false) != nil {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		query, err := parseOutcomeQuery(request)
+		if err != nil {
+			writeOutcomeHTTPError(writer, http.StatusBadRequest, err)
+			return
+		}
+		waitSeconds := uint64(20)
+		if raw := request.URL.Query().Get("wait_seconds"); raw != "" {
+			waitSeconds, err = strconv.ParseUint(raw, 10, 8)
+			if err != nil || waitSeconds > 25 {
+				http.Error(writer, "invalid wait_seconds", http.StatusBadRequest)
+				return
+			}
+		}
+		page, err := store.SubscribeOutcomes(request.Context(), query, time.Duration(waitSeconds)*time.Second)
+		if err != nil {
+			http.Error(writer, "subscription interrupted", http.StatusRequestTimeout)
+			return
+		}
+		writeJSON(writer, http.StatusOK, page)
+	})
 	mux.HandleFunc("POST /v1/intents/admission-challenge", func(writer http.ResponseWriter, request *http.Request) {
 		if authorize == nil || authorize.Authorize(request.Header.Get("Authorization"), true) != nil {
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
@@ -164,6 +277,40 @@ func Handler(store *Store, authorize HTTPAuthorizer) http.Handler {
 		writeJSON(writer, http.StatusOK, page)
 	})
 	return mux
+}
+
+func writeOutcomeHTTPError(writer http.ResponseWriter, status int, err error) {
+	code := commerce.OutcomeErrorCodeOf(err)
+	writer.Header().Set("X-TOS-Error-Code", string(code))
+	http.Error(writer, string(code), status)
+}
+
+func parseOutcomeQuery(request *http.Request) (OutcomeQuery, error) {
+	values := request.URL.Query()
+	limit := uint64(100)
+	var err error
+	if values.Get("limit") != "" {
+		limit, err = strconv.ParseUint(values.Get("limit"), 10, 32)
+		if err != nil || limit == 0 || limit > MaxSearchResults {
+			return OutcomeQuery{}, errors.New("invalid limit")
+		}
+	}
+	var cursor uint64
+	if raw := values.Get("cursor"); raw != "" {
+		if !strings.HasPrefix(raw, "seq:") {
+			return OutcomeQuery{}, errors.New("invalid cursor")
+		}
+		cursor, err = strconv.ParseUint(strings.TrimPrefix(raw, "seq:"), 10, 64)
+		if err != nil || cursor == 0 {
+			return OutcomeQuery{}, errors.New("invalid cursor")
+		}
+	}
+	query := OutcomeQuery{SubjectProfileURI: values.Get("subject_profile_uri"), SubjectID: values.Get("subject_id"), ActorAgentID: values.Get("actor_agent_id"),
+		AssertionProfileURIs: append([]string(nil), values["assertion_profile_uri"]...), Limit: uint32(limit), AfterCursor: cursor}
+	for _, value := range values["event_kind"] {
+		query.EventKinds = append(query.EventKinds, commerce.OperationOutcomeEventKind(value))
+	}
+	return query, nil
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {

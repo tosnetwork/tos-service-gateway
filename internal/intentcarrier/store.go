@@ -122,6 +122,21 @@ func (store *Store) Close() error {
 	return err
 }
 
+// ReceiptPublicKey is safe provisioning metadata. Operators pin this value in
+// OpenFox over their deployment/configuration channel; network responses alone
+// are never accepted as the Carrier identity bootstrap.
+func (store *Store) ReceiptPublicKey() string {
+	if store == nil {
+		return ""
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if len(store.admissionKey) != ed25519.PrivateKeySize {
+		return ""
+	}
+	return "ed25519:" + hex.EncodeToString(store.admissionKey.Public().(ed25519.PublicKey))
+}
+
 func (store *Store) IssueAdmission(actorID, audience string, declaredBytes uint64) (commerce.SignedOperationAdmissionChallenge, error) {
 	return store.IssueAdmissionFor("publication.publish", actorID, audience, declaredBytes)
 }
@@ -130,7 +145,7 @@ func (store *Store) IssueAdmissionFor(operationKind, actorID, audience string, d
 	if store == nil || actorID == "" || audience == "" || declaredBytes == 0 || declaredBytes > MaxStoredIntentBytes {
 		return commerce.SignedOperationAdmissionChallenge{}, errors.New("Intent publication admission request is invalid")
 	}
-	if operationKind != "publication.publish" && operationKind != "publication.withdraw" {
+	if operationKind != "publication.publish" && operationKind != "publication.withdraw" && operationKind != "operation.publish" {
 		return commerce.SignedOperationAdmissionChallenge{}, errors.New("unsupported Carrier admission operation")
 	}
 	resourceDigest, err := commerce.AdmissionResourceVectorDigest(operationKind, declaredBytes,

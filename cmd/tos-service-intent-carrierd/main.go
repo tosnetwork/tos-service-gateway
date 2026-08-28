@@ -127,7 +127,7 @@ func run(state, carrierID, listen, readTokenPath, writeTokenPath, certPath, keyP
 	}
 	defer store.Close()
 	if check {
-		fmt.Printf("configuration_valid=true carrier_id=%s independent_store=gateway-journal\n", carrierID)
+		fmt.Printf("configuration_valid=true carrier_id=%s independent_store=gateway-journal outcome_receipt_public_key=%s\n", carrierID, store.ReceiptPublicKey())
 		return nil
 	}
 	authorizer := tokenAuthorizer{readHash: sha256.Sum256(readToken), writeHash: sha256.Sum256(writeToken)}
@@ -149,7 +149,8 @@ func run(state, carrierID, listen, readTokenPath, writeTokenPath, certPath, keyP
 			done <- server.Serve(listener)
 		}
 	}()
-	fmt.Printf("ready=true carrier_id=%s listen=%s profile=gateway-intent independent_store=true\n", carrierID, listen)
+	fmt.Printf("ready=true carrier_id=%s listen=%s profile=gateway-intent independent_store=true outcome_receipt_public_key=%s\n",
+		carrierID, listen, store.ReceiptPublicKey())
 	select {
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	connectrpc.com/connect v1.19.1
-	github.com/tosnetwork/tos-service-protocol v0.0.0-20260825005653-0cd6b53f2c35
+	github.com/tosnetwork/tos-service-protocol v0.0.0-20260828000705-8d8b80ad5934
 	golang.org/x/sys v0.46.0
 )
 
