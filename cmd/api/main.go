@@ -18,6 +18,7 @@ import (
 	"github.com/tosnetwork/tos-service-gateway/internal/intentcarrier"
 	"github.com/tosnetwork/tos-service-gateway/internal/nativegateway"
 	"github.com/tosnetwork/tos-service-gateway/internal/quotesource"
+	"github.com/tosnetwork/tos-service-gateway/internal/trustedcapabilitycarrier"
 	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
 	"github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1/tosservicev1connect"
 	"github.com/tosnetwork/tos-service-protocol/pkg/capabilitycatalog"
@@ -99,6 +100,38 @@ func main() {
 		mux.Handle("/v1/intents/", intentHandler)
 		mux.Handle("/v1/intent-actions/", intentHandler)
 	}
+	if cfg.CapabilityCarrier.Directory != "" {
+		authorityToken, carrierErr := loadCapabilityCarrierAuthorityToken(cfg.CapabilityCarrier.AuthorityTokenFile)
+		if carrierErr != nil {
+			logger.Error("load Capability Carrier epoch authority token", "error", carrierErr)
+			os.Exit(2)
+		}
+		generationLease, recoveryKey, carrierErr := loadCapabilityCarrierGenerationLease(cfg.CapabilityCarrier.GenerationLeaseFile, cfg.CapabilityCarrier.AuthorityPublicKey, cfg.CapabilityCarrier.CarrierID, cfg.CapabilityCarrier.SourceGeneration)
+		if carrierErr != nil {
+			logger.Error("load externally authorized Capability Carrier generation", "error", carrierErr)
+			os.Exit(2)
+		}
+		epochAuthority, carrierErr := trustedcapabilitycarrier.OpenHTTPEpochAuthority(cfg.CapabilityCarrier.AuthorityURL, authorityToken, generationLease, recoveryKey, time.Now(), nil)
+		if carrierErr != nil {
+			logger.Error("configure external Capability Carrier epoch authority", "error", carrierErr)
+			os.Exit(2)
+		}
+		signingKey, carrierErr := loadCapabilityCarrierSigningKey(cfg.CapabilityCarrier.SigningKeyFile)
+		if carrierErr != nil {
+			logger.Error("load Capability Carrier signing key", "error", carrierErr)
+			os.Exit(2)
+		}
+		carrier, carrierErr := trustedcapabilitycarrier.Open(cfg.CapabilityCarrier.Directory, cfg.CapabilityCarrier.CarrierID,
+			cfg.CapabilityCarrier.SourceGeneration, time.Now, signingKey, epochAuthority)
+		if carrierErr != nil {
+			logger.Error("configure Capability Carrier", "error", carrierErr)
+			os.Exit(2)
+		}
+		defer carrier.Close()
+		capabilityHandler := trustedcapabilitycarrier.Handler(carrier, capabilityCarrierAuthorizer{cfg.CapabilityCarrier.PrincipalTokens}.Authorize)
+		mux.Handle("/v1/capability-objects", capabilityHandler)
+		mux.Handle("/v1/capability-objects/", capabilityHandler)
+	}
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", readinessHandler(backend, cfg.TOSRPC.Timeout))
 	mux.HandleFunc("GET /.well-known/tos-service.json", gatewayDiscoveryHandler(cfg, time.Now))
@@ -148,9 +181,10 @@ type gatewayDiscoveryNetwork struct {
 	GenesisFileHash string `json:"genesis_file_hash"`
 }
 type gatewayDiscoveryServices struct {
-	NativeConnect string `json:"native_connect"`
-	DNSConnect    string `json:"dns_alias_connect"`
-	IntentHTTP    string `json:"intent_http,omitempty"`
+	NativeConnect  string `json:"native_connect"`
+	DNSConnect     string `json:"dns_alias_connect"`
+	IntentHTTP     string `json:"intent_http,omitempty"`
+	CapabilityHTTP string `json:"capability_http,omitempty"`
 }
 type gatewayDiscoveryLimits struct {
 	MaxRequestBytes  int `json:"max_request_bytes"`
@@ -162,7 +196,7 @@ func gatewayDiscoveryHandler(cfg config.Config, now func() time.Time) http.Handl
 		document := gatewayDiscoveryDocument{Schema: "tos.service.gateway-discovery.v1", Protocol: "tos_service_v1",
 			Network:          gatewayDiscoveryNetwork{cfg.Catalog.NetworkID, cfg.Catalog.GenesisRootHash, cfg.Catalog.GenesisFileHash},
 			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{NativeConnect: cfg.PublicBaseURL, DNSConnect: cfg.PublicBaseURL,
-				IntentHTTP: intentServiceURL(cfg)},
+				IntentHTTP: intentServiceURL(cfg), CapabilityHTTP: capabilityServiceURL(cfg)},
 			Limits:    gatewayDiscoveryLimits{MaxRequestBytes: 1 << 20, MaxResponseBytes: cfg.TOSRPC.MaxMessageBytes},
 			ExpiresAt: now().Add(time.Hour).Unix()}
 		w.Header().Set("Content-Type", "application/json")

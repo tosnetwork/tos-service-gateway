@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,14 +27,21 @@ type TOSRPCConfig struct {
 }
 
 type Config struct {
-	Addr             string
-	PublicBaseURL    string
-	NativeReadToken  string
-	NativeRelayToken string
-	TOSRPC           TOSRPCConfig
-	Catalog          CatalogConfig
-	IntentCarrier    IntentCarrierConfig
-	QuoteProfileFile string
+	Addr              string
+	PublicBaseURL     string
+	NativeReadToken   string
+	NativeRelayToken  string
+	TOSRPC            TOSRPCConfig
+	Catalog           CatalogConfig
+	IntentCarrier     IntentCarrierConfig
+	CapabilityCarrier CapabilityCarrierConfig
+	QuoteProfileFile  string
+}
+
+type CapabilityCarrierConfig struct {
+	Directory, AuthorityURL, AuthorityTokenFile, AuthorityPublicKey, GenerationLeaseFile, CarrierID, SigningKeyFile string
+	SourceGeneration                                                                                                uint64
+	PrincipalTokens                                                                                                 map[string]string
 }
 
 type IntentCarrierConfig struct {
@@ -79,7 +87,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg := Config{
-		Addr:             envOr("TOS_SERVICE_ADDR", ":8080"),
+		Addr:             envOr("TOS_SERVICE_ADDR", "127.0.0.1:8080"),
 		PublicBaseURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("TOS_SERVICE_PUBLIC_BASE_URL")), "/"),
 		NativeReadToken:  strings.TrimSpace(os.Getenv("TOS_SERVICE_READ_TOKEN")),
 		NativeRelayToken: strings.TrimSpace(os.Getenv("TOS_SERVICE_RELAY_TOKEN")),
@@ -98,8 +106,19 @@ func Load() (Config, error) {
 			CarrierID: strings.TrimSpace(os.Getenv("TOS_SERVICE_INTENT_CARRIER_ID")), MaxEntries: uint32(maxIntentEntries),
 			MaxActorEntries: uint32(maxActorIntentEntries)},
 		QuoteProfileFile: strings.TrimSpace(os.Getenv("TOS_SERVICE_PROVIDER_QUOTE_PROFILE_FILE")),
+		CapabilityCarrier: CapabilityCarrierConfig{Directory: strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_DIRECTORY")),
+			AuthorityURL:        strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_AUTHORITY_URL")),
+			AuthorityTokenFile:  strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_AUTHORITY_TOKEN_FILE")),
+			AuthorityPublicKey:  strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_AUTHORITY_PUBLIC_KEY")),
+			GenerationLeaseFile: strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_GENERATION_LEASE_FILE")),
+			CarrierID:           strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_ID")), SigningKeyFile: strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_SIGNING_KEY_FILE")),
+			SourceGeneration: uint64Env("TOS_SERVICE_CAPABILITY_CARRIER_SOURCE_GENERATION", 0)},
 	}
 	cfg.IntentCarrier.AuthorityPins, err = parseAuthorityPins(os.Getenv("TOS_SERVICE_INTENT_AUTHORITY_PINS"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CapabilityCarrier.PrincipalTokens, err = parsePrincipalTokens(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_PRINCIPAL_TOKENS"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -109,6 +128,11 @@ func Load() (Config, error) {
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Addr) == "" {
 		return errors.New("TOS_SERVICE_ADDR is required")
+	}
+	listenHost, _, listenErr := net.SplitHostPort(c.Addr)
+	listenIP := net.ParseIP(listenHost)
+	if listenErr != nil || listenIP == nil || !listenIP.IsLoopback() {
+		return errors.New("TOS_SERVICE_ADDR must be a literal loopback backend address behind an authenticated TLS terminator")
 	}
 	publicURL, err := url.Parse(c.PublicBaseURL)
 	if err != nil || publicURL == nil || publicURL.Scheme == "" || publicURL.Host == "" || publicURL.User != nil || publicURL.RawQuery != "" || publicURL.Fragment != "" || publicURL.Path != "" {
@@ -162,10 +186,47 @@ func (c Config) Validate() error {
 	} else if c.IntentCarrier.CarrierID != "" {
 		return errors.New("TOS_SERVICE_INTENT_CARRIER_ID requires an Intent Carrier directory")
 	}
+	if c.CapabilityCarrier.Directory != "" {
+		for _, path := range []string{c.CapabilityCarrier.Directory, c.CapabilityCarrier.AuthorityTokenFile, c.CapabilityCarrier.GenerationLeaseFile, c.CapabilityCarrier.SigningKeyFile} {
+			if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+				return errors.New("enabled Capability Carrier paths must be absolute and clean")
+			}
+		}
+		authorityURL, authorityErr := url.Parse(c.CapabilityCarrier.AuthorityURL)
+		if authorityErr != nil || authorityURL == nil || authorityURL.Scheme != "https" || authorityURL.Host == "" || authorityURL.User != nil || authorityURL.Path != "/v1/carrier-source-state" || authorityURL.RawQuery != "" || authorityURL.Fragment != "" {
+			return errors.New("enabled Capability Carrier requires an external HTTPS authority URL ending at /v1/carrier-source-state")
+		}
+		if c.CapabilityCarrier.CarrierID == "" || c.CapabilityCarrier.SourceGeneration == 0 || len(c.CapabilityCarrier.PrincipalTokens) == 0 || !strings.HasPrefix(c.CapabilityCarrier.AuthorityPublicKey, "ed25519:") {
+			return errors.New("enabled Capability Carrier requires external authority, ID, generation, signing key, and principals")
+		}
+	} else if c.CapabilityCarrier.CarrierID != "" || c.CapabilityCarrier.AuthorityURL != "" || c.CapabilityCarrier.AuthorityTokenFile != "" || c.CapabilityCarrier.AuthorityPublicKey != "" || c.CapabilityCarrier.GenerationLeaseFile != "" || c.CapabilityCarrier.SigningKeyFile != "" || c.CapabilityCarrier.SourceGeneration != 0 || len(c.CapabilityCarrier.PrincipalTokens) != 0 {
+		return errors.New("partial Capability Carrier configuration is forbidden")
+	}
 	if c.QuoteProfileFile != "" && (!filepath.IsAbs(c.QuoteProfileFile) || filepath.Clean(c.QuoteProfileFile) != c.QuoteProfileFile) {
 		return errors.New("TOS_SERVICE_PROVIDER_QUOTE_PROFILE_FILE must be absolute and clean")
 	}
 	return nil
+}
+
+func parsePrincipalTokens(value string) (map[string]string, error) {
+	out := map[string]string{}
+	usedTokens := map[string]bool{}
+	for _, item := range strings.Split(value, ",") {
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		parts := strings.SplitN(strings.TrimSpace(item), "=", 2)
+		if len(parts) != 2 || parts[0] == "" || len(parts[0]) > 256 || strings.TrimSpace(parts[0]) != parts[0] ||
+			len(parts[1]) < 32 || strings.TrimSpace(parts[1]) != parts[1] || usedTokens[parts[1]] {
+			return nil, errors.New("Capability Carrier principal token mapping is invalid or ambiguous")
+		}
+		if _, duplicate := out[parts[0]]; duplicate {
+			return nil, errors.New("duplicate Capability Carrier principal")
+		}
+		out[parts[0]] = parts[1]
+		usedTokens[parts[1]] = true
+	}
+	return out, nil
 }
 
 // parseAuthorityPins accepts a comma-separated authority-id=ed25519:<hex>
@@ -233,4 +294,16 @@ func boolEnv(name string, fallback bool) (bool, error) {
 		return false, errors.New(name + " must be a boolean")
 	}
 	return parsed, nil
+}
+
+func uint64Env(name string, fallback uint64) uint64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }

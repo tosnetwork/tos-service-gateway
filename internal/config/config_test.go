@@ -7,7 +7,7 @@ import (
 )
 
 func validConfig() Config {
-	return Config{Addr: ":8080", PublicBaseURL: "https://gateway.example", NativeReadToken: "read", NativeRelayToken: "relay",
+	return Config{Addr: "127.0.0.1:8080", PublicBaseURL: "https://gateway.example", NativeReadToken: "read", NativeRelayToken: "relay",
 		TOSRPC: TOSRPCConfig{URL: "https://tos-service-protocol.internal", Token: "backend", Timeout: time.Second, MaxMessageBytes: 1024},
 		Catalog: CatalogConfig{Directory: "/var/lib/tos-service/catalog", NetworkID: "test", GenesisRootHash: "sha256:root",
 			GenesisFileHash: "sha256:file", RegistryCodeHash: "tvm-cell-sha256:code", MaxEntries: 100}}

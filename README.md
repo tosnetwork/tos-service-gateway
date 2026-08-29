@@ -41,6 +41,7 @@ server, then run:
 ```bash
 export TOS_SERVICE_READ_TOKEN='<read-token>'
 export TOS_SERVICE_RELAY_TOKEN='<distinct-relay-token>'
+export TOS_SERVICE_ADDR='127.0.0.1:8080' # loopback backend behind the TLS terminator
 export TOS_SERVICE_PUBLIC_BASE_URL='https://gateway.example'
 export TOS_SERVICE_TOS_RPC_URL='http://127.0.0.1:8090'
 export TOS_SERVICE_TOS_RPC_TOKEN='<private-backend-token>'
