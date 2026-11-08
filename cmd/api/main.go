@@ -22,6 +22,7 @@ import (
 	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
 	"github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1/tosservicev1connect"
 	"github.com/tosnetwork/tos-service-protocol/pkg/capabilitycatalog"
+	"github.com/tosnetwork/tos-service-protocol/pkg/mldsa44"
 )
 
 func main() {
@@ -59,8 +60,7 @@ func main() {
 		GenesisRootHash: cfg.Catalog.GenesisRootHash, GenesisFileHash: cfg.Catalog.GenesisFileHash}
 	var quoteSource nativegateway.QuoteSource
 	if cfg.QuoteProfileFile != "" {
-		quoteSource, err = quotesource.Load(cfg.QuoteProfileFile, catalogBackend{backend}, network,
-			cfg.Catalog.RegistryCodeHash, cfg.TOSRPC.Timeout)
+		quoteSource, err = quotesource.Load(cfg.QuoteProfileFile, network, cfg.Catalog.RegistryCodeHash, cfg.TOSRPC.Timeout)
 		if err != nil {
 			logger.Error("configure provider Quote source", "error", err)
 			os.Exit(2)
@@ -87,9 +87,19 @@ func main() {
 	discoveryPath, discoveryHandler := tosservicev1connect.NewCapabilityDiscoveryServiceHandler(gateway)
 	mux.Handle(discoveryPath, discoveryHandler)
 	if cfg.IntentCarrier.Directory != "" {
+		verifier, verifierErr := mldsa44.NewTosctl(mldsa44.TosctlConfig{Binary: cfg.IntentCarrier.TosctlBinary,
+			SHA256: cfg.IntentCarrier.TosctlSHA256})
+		if verifierErr != nil {
+			logger.Error("configure Intent Carrier ML-DSA-44 verifier", "error", verifierErr)
+			os.Exit(2)
+		}
+		authorities, authorityErr := intentcarrier.NewPinnedAuthorities(cfg.IntentCarrier.AuthorityPins, verifier)
+		if authorityErr != nil {
+			logger.Error("configure Intent Carrier Action Authority pins", "error", authorityErr)
+			os.Exit(2)
+		}
 		carrier, carrierErr := intentcarrier.Open(cfg.IntentCarrier.Directory, cfg.IntentCarrier.CarrierID, cfg.IntentCarrier.MaxEntries,
-			cfg.IntentCarrier.MaxActorEntries,
-			intentcarrier.PinnedAuthorities(cfg.IntentCarrier.AuthorityPins))
+			cfg.IntentCarrier.MaxActorEntries, authorities)
 		if carrierErr != nil {
 			logger.Error("configure Intent Carrier", "error", carrierErr)
 			os.Exit(2)

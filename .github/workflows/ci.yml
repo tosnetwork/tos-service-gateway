@@ -10,26 +10,61 @@ on:
 permissions:
   contents: read
 
+env:
+  # The tosctl build that verifies ML-DSA-44 Action Authority signatures and,
+  # for the context-separation tests, signs custody authorizations. Tests that
+  # check real ML-DSA-44 bytes fail, rather than skip, without it. Repin when
+  # the helper lands on the tos main branch.
+  TOS_HELPER_REPOSITORY: tosnetwork/tos
+  TOS_HELPER_COMMIT: c41331dd3103c0eac719d7e5f368079f0a40e64f
+
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
+      # The two checkouts are siblings so the repository's own format and
+      # vet checks never walk the helper's source tree.
       - uses: actions/checkout@v4
         with:
+          path: gateway
           # pull_request events normally check out GitHub's synthetic merge
           # ref. TOS Service Protocol validates the exact proposed implementation here; PR
           # mergeability is checked independently by GitHub.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Check out the pinned tosctl helper source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TOS_HELPER_REPOSITORY }}
+          ref: ${{ env.TOS_HELPER_COMMIT }}
+          path: tos
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tos/tosctl/src -> target
+          key: tosctl-${{ env.TOS_HELPER_COMMIT }}
+      - name: Build the tosctl helper
+        working-directory: tos/tosctl/src
+        run: cargo build -p tosctl --bin tosctl --locked
+      - name: Pin the tosctl helper for the tests
+        run: |
+          helper="$GITHUB_WORKSPACE/tos/tosctl/src/target/debug/tosctl"
+          chmod 0755 "$helper"
+          echo "TOS_SERVICE_TOSCTL=$helper" >> "$GITHUB_ENV"
+          echo "TOS_SERVICE_TOSCTL_SHA256=$(sha256sum "$helper" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'
           cache: true
+          cache-dependency-path: gateway/go.sum
       - name: Verify checked-out revision
+        working-directory: gateway
         run: |
           echo "event=${{ github.event_name }}"
           echo "expected=${{ github.event.pull_request.head.sha || github.sha }}"
           echo "actual=$(git rev-parse HEAD)"
           test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
       - name: Verify the repository
+        working-directory: gateway
         run: make verify

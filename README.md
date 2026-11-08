@@ -61,10 +61,28 @@ GOWORK=off go run ./cmd/api
 
 The Quote profile schema is illustrated in
 [`docs/provider-quote-profile.example.json`](docs/provider-quote-profile.example.json).
-It binds the provider Agent/address, exact TOS-network stablecoin identity,
-atomic price, transport policy, canonical manifest file, and bounded timing.
-Every request re-resolves the Capability from finalized Native state before a
-proposal is returned.
+It binds the provider Agent, the canonical manifest file, the transport policy,
+the proposal lifetime, and the Service Actor read path: three to eight TOS
+JSON-RPC endpoints read under a strict-majority quorum, the Native Registry
+code BOC, the pinned Service Actor release code hash (which must equal the
+manifest's key 21 code hash), and an owner-only `0700` state directory for the
+finalized checkpoint high-water files. The profile carries no price: every
+request reads the Capability and the Service Actor named by manifest key 21 at
+one finalized checkpoint and quotes the actor's current native-TOS price,
+storage fee and terms hash. The proposal grants no authority; the buyer
+re-verifies every rail field before calling.
+
+The optional Intent Carrier (`TOS_SERVICE_INTENT_CARRIER_DIRECTORY`) admits a
+publication only under an ML-DSA-44 Action Authority Writer Fence and
+AuthorizedActionV1. `TOS_SERVICE_INTENT_AUTHORITY_PINS` is a comma-separated
+list of `AUTHORITY_ID=mldsa44:<key ID>@/absolute/key.hex` pins; each key file
+is an owner-only mode `0600` file holding the 1,312-byte public key in
+lowercase hex, and the key must derive the pinned key ID. Ed25519 pins are
+refused. `TOS_SERVICE_TOSCTL` and `TOS_SERVICE_TOSCTL_SHA256` name the pinned
+tosctl helper that verifies the signatures; it is configured without a vault
+and cannot sign. `tos-service-intent-carrierd` takes the same pins through
+repeated `--authority` flags and the helper through `--tosctl` and
+`--tosctl-sha256` (defaulting to the same environment variables).
 
 Plaintext backend RPC is rejected unless `TOS_SERVICE_TOS_RPC_INSECURE=true`. Use
 HTTPS outside local development. Optional TLS settings are:
