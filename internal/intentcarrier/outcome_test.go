@@ -2,6 +2,7 @@ package intentcarrier
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -24,7 +25,7 @@ func TestOutcomeHTTPBoundaryIsAuthorizedStrictAndBounded(t *testing.T) {
 	}
 	authorityKey := testAuthorityKey(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
-	store, err := Open(directory, "carrier:http-outcome", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, err := Open(directory, "carrier:http-outcome", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +100,7 @@ func TestOutcomeCarrierRetainsExactAssertionsWithoutBecomingAuthority(t *testing
 		t.Fatal(err)
 	}
 	authorityKey := testAuthorityKey(t)
-	store, err := Open(directory, "carrier:outcome", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, err := Open(directory, "carrier:outcome", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,9 +112,9 @@ func TestOutcomeCarrierRetainsExactAssertionsWithoutBecomingAuthority(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence, err := commerce.SignWriterFence(commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test", AgentID: outcomeActorID(),
+	fence, err := commerce.SignWriterFence(context.Background(), commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test", AgentID: outcomeActorID(),
 		InstanceID: "instance:test", LeaseID: "lease:test", WriterGeneration: 1, IssuedAtUnix: uint64(now.Add(-time.Second).Unix()),
-		ExpiresAtUnix: uint64(now.Add(time.Hour).Unix()), AuthorityID: "authority:test", Scope: []string{"operation.publish"}}, authorityKey)
+		ExpiresAtUnix: uint64(now.Add(time.Hour).Unix()), AuthorityID: "authority:test", Scope: []string{"operation.publish"}}, authorityKey.signer, authorityKey.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +127,7 @@ func TestOutcomeCarrierRetainsExactAssertionsWithoutBecomingAuthority(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	action, err = commerce.SignAuthorizedAction(action, authorityKey)
+	action, err = commerce.SignAuthorizedAction(context.Background(), action, authorityKey.keyID, authorityKey.signer, authorityKey.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +196,7 @@ func TestOutcomeCarrierRebuildsFromExactRetainedCorpusAfterDatabaseLoss(t *testi
 	}
 	authorityKey := testAuthorityKey(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
-	store, err := Open(directory, "carrier:rebuild", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, err := Open(directory, "carrier:rebuild", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +222,7 @@ func TestOutcomeCarrierRebuildsFromExactRetainedCorpusAfterDatabaseLoss(t *testi
 	if err = os.WriteFile(filepath.Join(directory, ".carrier-admission-ed25519"), keyBackup, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rebuilt, err := Open(directory, "carrier:rebuild", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	rebuilt, err := Open(directory, "carrier:rebuild", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,16 +235,16 @@ func TestOutcomeCarrierRebuildsFromExactRetainedCorpusAfterDatabaseLoss(t *testi
 	}
 }
 
-func authorizedOutcomePublication(t *testing.T, store *Store, authorityKey ed25519.PrivateKey, now time.Time) (commerce.OperationCarrierRequestV1, commerce.AuthorizedAction, commerce.WriterFence) {
+func authorizedOutcomePublication(t *testing.T, store *Store, authorityKey testAuthority, now time.Time) (commerce.OperationCarrierRequestV1, commerce.AuthorizedAction, commerce.WriterFence) {
 	t.Helper()
 	request := outcomeCarrierRequest(t, store, now)
 	canonical, err := codec.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence, err := commerce.SignWriterFence(commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test", AgentID: outcomeActorID(),
+	fence, err := commerce.SignWriterFence(context.Background(), commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test", AgentID: outcomeActorID(),
 		InstanceID: "instance:test", LeaseID: "lease:test", WriterGeneration: 1, IssuedAtUnix: uint64(now.Add(-time.Second).Unix()),
-		ExpiresAtUnix: uint64(now.Add(time.Hour).Unix()), AuthorityID: "authority:test", Scope: []string{"operation.publish"}}, authorityKey)
+		ExpiresAtUnix: uint64(now.Add(time.Hour).Unix()), AuthorityID: "authority:test", Scope: []string{"operation.publish"}}, authorityKey.signer, authorityKey.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +255,7 @@ func authorizedOutcomePublication(t *testing.T, store *Store, authorityKey ed255
 	action, err := commerce.BuildAuthorizedAction("owner:test", outcomeActorID(), "operation.publish", fields, canonical, fence, 1,
 		"sha256:"+strings.Repeat("1", 64), "", "not-published", uint64(now.Add(time.Hour).Unix()))
 	if err == nil {
-		action, err = commerce.SignAuthorizedAction(action, authorityKey)
+		action, err = commerce.SignAuthorizedAction(context.Background(), action, authorityKey.keyID, authorityKey.signer, authorityKey.controller)
 	}
 	if err != nil {
 		t.Fatal(err)

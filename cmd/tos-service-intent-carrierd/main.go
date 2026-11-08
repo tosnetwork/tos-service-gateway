@@ -6,11 +6,9 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,29 +22,21 @@ import (
 	"time"
 
 	"github.com/tosnetwork/tos-service-gateway/internal/intentcarrier"
+	"github.com/tosnetwork/tos-service-protocol/pkg/mldsa44"
 )
 
-type pinsFlag map[string]ed25519.PublicKey
+// pinsFlag collects repeated --authority values; ParseAuthorityPins reads
+// them at startup.
+type pinsFlag []string
 
 func (p *pinsFlag) String() string { return fmt.Sprintf("%d configured", len(*p)) }
 func (p *pinsFlag) Set(value string) error {
-	parts := strings.SplitN(value, "=ed25519:", 2)
-	if len(parts) != 2 || parts[0] == "" {
-		return errors.New("authority pin must be AUTHORITY_ID=ed25519:HEX")
-	}
-	raw, err := hex.DecodeString(parts[1])
-	if err != nil || len(raw) != ed25519.PublicKeySize {
-		return errors.New("authority pin contains an invalid Ed25519 key")
-	}
-	if *p == nil {
-		*p = pinsFlag{}
-	}
-	if _, exists := (*p)[parts[0]]; exists {
-		return errors.New("authority pin is duplicated")
-	}
-	(*p)[parts[0]] = ed25519.PublicKey(raw)
+	*p = append(*p, value)
 	return nil
 }
+
+// helperFlags pins the verify-only tosctl helper for ML-DSA-44 signatures.
+type helperFlags struct{ binary, sha256 string }
 
 type tokenAuthorizer struct{ readHash, writeHash [32]byte }
 
@@ -77,13 +67,15 @@ func main() {
 	maxActorEntries := flag.Uint64("max-actor-entries", 1000, "maximum retained publications per issuer")
 	check := flag.Bool("check", false, "validate configuration and state without listening")
 	pins := pinsFlag{}
-	flag.Var(&pins, "authority", "pinned writer-fence authority AUTHORITY_ID=ed25519:HEX (repeat)")
+	flag.Var(&pins, "authority", "pinned writer-fence authority AUTHORITY_ID=mldsa44:<key ID>@<key file> (repeat)")
+	tosctl := flag.String("tosctl", os.Getenv("TOS_SERVICE_TOSCTL"), "absolute path of the verify-only tosctl helper")
+	tosctlSHA256 := flag.String("tosctl-sha256", os.Getenv("TOS_SERVICE_TOSCTL_SHA256"), "lowercase hex SHA-256 of the tosctl helper")
 	flag.Parse()
 	if *maxEntries > 1_000_000 || *maxActorEntries > 1_000_000 {
 		fatal(errors.New("retention limit is too large"))
 	}
 	if err := run(*state, *carrierID, *listen, *readToken, *writeToken, *tlsCert, *tlsKey,
-		uint32(*maxEntries), uint32(*maxActorEntries), pins, *check); err != nil {
+		uint32(*maxEntries), uint32(*maxActorEntries), pins, helperFlags{binary: *tosctl, sha256: *tosctlSHA256}, *check); err != nil {
 		fatal(err)
 	}
 }
@@ -94,9 +86,13 @@ func fatal(err error) {
 }
 
 func run(state, carrierID, listen, readTokenPath, writeTokenPath, certPath, keyPath string,
-	maxEntries, maxActorEntries uint32, pins pinsFlag, check bool) error {
+	maxEntries, maxActorEntries uint32, pins pinsFlag, helper helperFlags, check bool) error {
 	if !filepath.IsAbs(state) || carrierID == "" || len(pins) == 0 || maxEntries == 0 || maxActorEntries == 0 {
 		return errors.New("incomplete Carrier configuration")
+	}
+	authorities, err := pinnedAuthorities(pins, helper)
+	if err != nil {
+		return err
 	}
 	readToken, err := loadToken(readTokenPath)
 	if err != nil {
@@ -120,14 +116,14 @@ func run(state, carrierID, listen, readTokenPath, writeTokenPath, certPath, keyP
 	if !loopback && (certPath == "" || keyPath == "") {
 		return errors.New("TLS is mandatory outside loopback")
 	}
-	store, err := intentcarrier.Open(state, carrierID, maxEntries, maxActorEntries,
-		intentcarrier.PinnedAuthorities(map[string]ed25519.PublicKey(pins)))
+	store, err := intentcarrier.Open(state, carrierID, maxEntries, maxActorEntries, authorities)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
 	if check {
-		fmt.Printf("configuration_valid=true carrier_id=%s independent_store=gateway-journal outcome_receipt_public_key=%s\n", carrierID, store.ReceiptPublicKey())
+		fmt.Printf("configuration_valid=true carrier_id=%s independent_store=gateway-journal outcome_receipt_public_key=%s authority_pins=%s\n",
+			carrierID, store.ReceiptPublicKey(), authorities.Describe())
 		return nil
 	}
 	authorizer := tokenAuthorizer{readHash: sha256.Sum256(readToken), writeHash: sha256.Sum256(writeToken)}
@@ -163,6 +159,23 @@ func run(state, carrierID, listen, readTokenPath, writeTokenPath, certPath, keyP
 		return nil
 	}
 	return err
+}
+
+// pinnedAuthorities reads the pins and pins the verify-only helper. The
+// helper is configured without a vault, so it cannot sign.
+func pinnedAuthorities(pins pinsFlag, helper helperFlags) (*intentcarrier.PinnedAuthorities, error) {
+	if helper.binary == "" || helper.sha256 == "" {
+		return nil, errors.New("--tosctl and --tosctl-sha256 (or TOS_SERVICE_TOSCTL and TOS_SERVICE_TOSCTL_SHA256) are required to verify ML-DSA-44 Action Authority signatures")
+	}
+	parsed, err := intentcarrier.ParseAuthorityPins(pins)
+	if err != nil {
+		return nil, err
+	}
+	verifier, err := mldsa44.NewTosctl(mldsa44.TosctlConfig{Binary: helper.binary, SHA256: helper.sha256})
+	if err != nil {
+		return nil, err
+	}
+	return intentcarrier.NewPinnedAuthorities(parsed, verifier)
 }
 
 func loadToken(path string) ([]byte, error) {

@@ -1,22 +1,19 @@
 {
-  "schema": "tos.service.provider-quote-profile.v1",
+  "schema": "tos.service.provider-quote-profile.v2",
   "provider_agent_id": "agent_<64 lowercase hex>",
-  "provider_address": "0:<64 lowercase hex>",
   "manifest_cbor_file": "/absolute/private/provider/manifest.cbor",
   "transport": {
     "security_mode": 1,
     "max_request_bytes": 1048576,
     "base_url": "https://provider.example"
   },
-  "maximum_price": {
-    "master_workchain": 0,
-    "master_account_id": "<64 lowercase hex>",
-    "master_code_hash": "tvm-cell-sha256:<64 lowercase hex>",
-    "wallet_code_hash": "tvm-cell-sha256:<64 lowercase hex>",
-    "decimals": 6,
-    "atomic_amount": "25000000"
-  },
   "proposal_ttl_seconds": 900,
-  "funding_window_seconds": 600,
-  "refund_delay_seconds": 1800
+  "tos_rpc_endpoints": [
+    "https://rpc-1.example",
+    "https://rpc-2.example",
+    "https://rpc-3.example"
+  ],
+  "registry_code_boc_file": "/absolute/private/provider/native-registry.boc.base64",
+  "service_actor_code_hash": "tvm-cell-sha256:<64 lowercase hex of the pinned Service Actor release>",
+  "state_directory": "/absolute/private/provider/quote-state"
 }

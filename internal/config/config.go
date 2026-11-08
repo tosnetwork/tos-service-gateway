@@ -2,9 +2,8 @@
 package config
 
 import (
-	"crypto/ed25519"
-	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -12,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tosnetwork/tos-service-gateway/internal/intentcarrier"
 )
 
 type TOSRPCConfig struct {
@@ -49,7 +50,11 @@ type IntentCarrierConfig struct {
 	CarrierID       string
 	MaxEntries      uint32
 	MaxActorEntries uint32
-	AuthorityPins   map[string]ed25519.PublicKey
+	AuthorityPins   map[string]intentcarrier.PinnedAuthority
+	// TosctlBinary and TosctlSHA256 pin the verify-only tosctl helper that
+	// checks ML-DSA-44 Action Authority signatures.
+	TosctlBinary string
+	TosctlSHA256 string
 }
 
 type CatalogConfig struct {
@@ -104,7 +109,9 @@ func Load() (Config, error) {
 			RegistryCodeHash: strings.TrimSpace(os.Getenv("TOS_SERVICE_REGISTRY_CODE_HASH")), MaxEntries: uint32(maxCatalogEntries)},
 		IntentCarrier: IntentCarrierConfig{Directory: strings.TrimSpace(os.Getenv("TOS_SERVICE_INTENT_CARRIER_DIRECTORY")),
 			CarrierID: strings.TrimSpace(os.Getenv("TOS_SERVICE_INTENT_CARRIER_ID")), MaxEntries: uint32(maxIntentEntries),
-			MaxActorEntries: uint32(maxActorIntentEntries)},
+			MaxActorEntries: uint32(maxActorIntentEntries),
+			TosctlBinary:    strings.TrimSpace(os.Getenv("TOS_SERVICE_TOSCTL")),
+			TosctlSHA256:    strings.TrimSpace(os.Getenv("TOS_SERVICE_TOSCTL_SHA256"))},
 		QuoteProfileFile: strings.TrimSpace(os.Getenv("TOS_SERVICE_PROVIDER_QUOTE_PROFILE_FILE")),
 		CapabilityCarrier: CapabilityCarrierConfig{Directory: strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_DIRECTORY")),
 			AuthorityURL:        strings.TrimSpace(os.Getenv("TOS_SERVICE_CAPABILITY_CARRIER_AUTHORITY_URL")),
@@ -183,8 +190,12 @@ func (c Config) Validate() error {
 			c.IntentCarrier.MaxActorEntries == 0 || c.IntentCarrier.MaxActorEntries > c.IntentCarrier.MaxEntries || len(c.IntentCarrier.AuthorityPins) == 0 {
 			return errors.New("enabled Intent Carrier requires a bounded ID and capacity")
 		}
-	} else if c.IntentCarrier.CarrierID != "" {
-		return errors.New("TOS_SERVICE_INTENT_CARRIER_ID requires an Intent Carrier directory")
+		if c.IntentCarrier.TosctlBinary == "" || c.IntentCarrier.TosctlSHA256 == "" {
+			return errors.New("enabled Intent Carrier requires TOS_SERVICE_TOSCTL and TOS_SERVICE_TOSCTL_SHA256 to verify ML-DSA-44 Action Authority signatures")
+		}
+	} else if c.IntentCarrier.CarrierID != "" || len(c.IntentCarrier.AuthorityPins) != 0 ||
+		c.IntentCarrier.TosctlBinary != "" || c.IntentCarrier.TosctlSHA256 != "" {
+		return errors.New("partial Intent Carrier configuration is forbidden")
 	}
 	if c.CapabilityCarrier.Directory != "" {
 		for _, path := range []string{c.CapabilityCarrier.Directory, c.CapabilityCarrier.AuthorityTokenFile, c.CapabilityCarrier.GenerationLeaseFile, c.CapabilityCarrier.SigningKeyFile} {
@@ -229,26 +240,20 @@ func parsePrincipalTokens(value string) (map[string]string, error) {
 	return out, nil
 }
 
-// parseAuthorityPins accepts a comma-separated authority-id=ed25519:<hex>
-// list. Pins are explicit deployment authority, not trust-on-first-use state.
-func parseAuthorityPins(value string) (map[string]ed25519.PublicKey, error) {
-	pins := make(map[string]ed25519.PublicKey)
+// parseAuthorityPins accepts a comma-separated list of
+// authority-id=mldsa44:<key ID>@<absolute key file> pins. Pins are explicit
+// deployment authority, not trust-on-first-use state.
+func parseAuthorityPins(value string) (map[string]intentcarrier.PinnedAuthority, error) {
 	if strings.TrimSpace(value) == "" {
-		return pins, nil
+		return map[string]intentcarrier.PinnedAuthority{}, nil
 	}
-	for _, item := range strings.Split(value, ",") {
-		parts := strings.SplitN(strings.TrimSpace(item), "=", 2)
-		if len(parts) != 2 || parts[0] == "" || !strings.HasPrefix(parts[1], "ed25519:") {
-			return nil, errors.New("TOS_SERVICE_INTENT_AUTHORITY_PINS is invalid")
-		}
-		raw, err := hex.DecodeString(strings.TrimPrefix(parts[1], "ed25519:"))
-		if err != nil || len(raw) != ed25519.PublicKeySize {
-			return nil, errors.New("TOS_SERVICE_INTENT_AUTHORITY_PINS contains an invalid key")
-		}
-		if _, duplicate := pins[parts[0]]; duplicate {
-			return nil, errors.New("TOS_SERVICE_INTENT_AUTHORITY_PINS contains a duplicate authority")
-		}
-		pins[parts[0]] = ed25519.PublicKey(append([]byte(nil), raw...))
+	items := strings.Split(value, ",")
+	for index := range items {
+		items[index] = strings.TrimSpace(items[index])
+	}
+	pins, err := intentcarrier.ParseAuthorityPins(items)
+	if err != nil {
+		return nil, fmt.Errorf("TOS_SERVICE_INTENT_AUTHORITY_PINS is invalid: %w", err)
 	}
 	return pins, nil
 }

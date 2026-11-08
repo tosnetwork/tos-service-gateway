@@ -2,6 +2,7 @@ package intentcarrier
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,8 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tosnetwork/tos-service-gateway/internal/actionauthoritytest"
 	commerce "github.com/tosnetwork/tos-service-protocol/pkg/agentcommerce"
 	protocolcodec "github.com/tosnetwork/tos-service-protocol/pkg/codec"
+	"github.com/tosnetwork/tos-service-protocol/pkg/mldsa44"
+	"github.com/tosnetwork/tos-service-protocol/pkg/mldsa44/mldsa44test"
 )
 
 func TestCarrierPublishesSearchesAndSurvivesRestart(t *testing.T) {
@@ -25,7 +29,7 @@ func TestCarrierPublishesSearchesAndSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	authorityKey := testAuthorityKey(t)
-	store, err := Open(directory, "carrier:test", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, err := Open(directory, "carrier:test", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +57,7 @@ func TestCarrierPublishesSearchesAndSurvivesRestart(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := Open(directory, "carrier:test", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	restarted, err := Open(directory, "carrier:test", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +82,7 @@ func TestCarrierHTTPIsBoundedAndAuthorized(t *testing.T) {
 		t.Fatal(err)
 	}
 	authorityKey := testAuthorityKey(t)
-	store, _ := Open(directory, "carrier:http", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, _ := Open(directory, "carrier:http", 10, 10, authorityKey.pins(t))
 	now := time.Unix(2_000_000_000, 0).UTC()
 	store.now = func() time.Time { return now }
 	intent := signedIntent(t, now)
@@ -132,7 +136,7 @@ func TestCarrierWithdrawalPreservesBytesButRemovesDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	authorityKey := testAuthorityKey(t)
-	store, err := Open(directory, "carrier:withdraw", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, err := Open(directory, "carrier:withdraw", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +184,7 @@ func TestCarrierCursorFollowsPublicationOrderAndStoreIsSingleWriter(t *testing.T
 		t.Fatal(err)
 	}
 	authorityKey := testAuthorityKey(t)
-	pins := PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)}
+	pins := authorityKey.pins(t)
 	store, err := Open(directory, "carrier:cursor", 10, 10, pins)
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +225,7 @@ func TestCarrierActorQuotaPreventsOneIssuerFromFillingSharedCapacity(t *testing.
 		t.Fatal(err)
 	}
 	authorityKey := testAuthorityKey(t)
-	store, err := Open(directory, "carrier:quota", 10, 1, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, err := Open(directory, "carrier:quota", 10, 1, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +255,7 @@ func TestCarrierRejectsSameGenerationFenceEquivocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	authorityKey := testAuthorityKey(t)
-	store, err := Open(directory, "carrier:fence", 10, 10, PinnedAuthorities{"authority:test": authorityKey.Public().(ed25519.PublicKey)})
+	store, err := Open(directory, "carrier:fence", 10, 10, authorityKey.pins(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,10 +273,10 @@ func TestCarrierRejectsSameGenerationFenceEquivocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	equivocatedFence, err := commerce.SignWriterFence(commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test",
+	equivocatedFence, err := commerce.SignWriterFence(context.Background(), commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test",
 		AgentID: second.Body.IssuerAgentID, InstanceID: "instance:other", LeaseID: "lease:other", WriterGeneration: 1,
 		IssuedAtUnix: uint64(now.Add(-time.Second).Unix()), ExpiresAtUnix: uint64(now.Add(time.Hour).Unix()),
-		AuthorityID: "authority:test", Scope: []string{"publication.publish"}}, authorityKey)
+		AuthorityID: "authority:test", Scope: []string{"publication.publish"}}, authorityKey.signer, authorityKey.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,23 +286,48 @@ func TestCarrierRejectsSameGenerationFenceEquivocation(t *testing.T) {
 	}
 }
 
-func testAuthorityKey(t *testing.T) ed25519.PrivateKey {
+// testAuthority names an Action Authority controller in custody and the
+// verifier that checks its signatures.
+type testAuthority struct {
+	signer     mldsa44.Signer
+	verifier   mldsa44.Verifier
+	controller string
+	keyID      string
+	publicKey  []byte
+}
+
+// testAuthorityKey is the deterministic in-process stand-in used by
+// pure-logic tests.
+func testAuthorityKey(t *testing.T) testAuthority {
 	t.Helper()
-	_, key, err := ed25519.GenerateKey(rand.Reader)
+	fake := &mldsa44test.Fake{}
+	return testAuthority{signer: fake, verifier: fake, controller: actionauthoritytest.Controller,
+		keyID: fake.KeyID(actionauthoritytest.Controller), publicKey: fake.PublicKey(actionauthoritytest.Controller)}
+}
+
+// pins pins the authority's key for authority:test.
+func (authority testAuthority) pins(t *testing.T) *PinnedAuthorities {
+	t.Helper()
+	keyID, err := mldsa44.ParseKeyIDText(authority.keyID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return key
+	pins, err := NewPinnedAuthorities(map[string]PinnedAuthority{"authority:test": {KeyID: keyID, PublicKey: authority.publicKey}},
+		authority.verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pins
 }
 
 func publicationAction(t *testing.T, store *Store, intent commerce.SignedAgentIntent,
-	authorityKey ed25519.PrivateKey) (commerce.AuthorizedAction, commerce.WriterFence) {
+	authorityKey testAuthority) (commerce.AuthorizedAction, commerce.WriterFence) {
 	t.Helper()
 	now := store.now().UTC()
-	fence, err := commerce.SignWriterFence(commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test",
+	fence, err := commerce.SignWriterFence(context.Background(), commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test",
 		AgentID: intent.Body.IssuerAgentID, InstanceID: "instance:test", LeaseID: "lease:test", WriterGeneration: 1,
 		IssuedAtUnix: uint64(now.Add(-time.Second).Unix()), ExpiresAtUnix: uint64(now.Add(time.Hour).Unix()),
-		AuthorityID: "authority:test", Scope: []string{"publication.publish"}}, authorityKey)
+		AuthorityID: "authority:test", Scope: []string{"publication.publish"}}, authorityKey.signer, authorityKey.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +335,7 @@ func publicationAction(t *testing.T, store *Store, intent commerce.SignedAgentIn
 }
 
 func publicationActionWithFence(t *testing.T, store *Store, intent commerce.SignedAgentIntent,
-	authorityKey ed25519.PrivateKey, fence commerce.WriterFence) commerce.AuthorizedAction {
+	authorityKey testAuthority, fence commerce.WriterFence) commerce.AuthorizedAction {
 	t.Helper()
 	now := store.now().UTC()
 	canonical, err := protocolcodec.Marshal(intent)
@@ -325,7 +354,7 @@ func publicationActionWithFence(t *testing.T, store *Store, intent commerce.Sign
 	if err != nil {
 		t.Fatal(err)
 	}
-	action, err = commerce.SignAuthorizedAction(action, authorityKey)
+	action, err = commerce.SignAuthorizedAction(context.Background(), action, authorityKey.keyID, authorityKey.signer, authorityKey.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,13 +362,13 @@ func publicationActionWithFence(t *testing.T, store *Store, intent commerce.Sign
 }
 
 func withdrawalAction(t *testing.T, store *Store, withdrawal commerce.SignedAgentIntentWithdrawal,
-	authorityKey ed25519.PrivateKey) (commerce.AuthorizedAction, commerce.WriterFence) {
+	authorityKey testAuthority) (commerce.AuthorizedAction, commerce.WriterFence) {
 	t.Helper()
 	now := store.now().UTC()
-	fence, err := commerce.SignWriterFence(commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test",
+	fence, err := commerce.SignWriterFence(context.Background(), commerce.WriterFenceBody{SchemaVersion: 1, OwnerID: "owner:test",
 		AgentID: withdrawal.Body.IssuerAgentID, InstanceID: "instance:test", LeaseID: "lease:test", WriterGeneration: 2,
 		IssuedAtUnix: uint64(now.Add(-time.Second).Unix()), ExpiresAtUnix: uint64(now.Add(time.Hour).Unix()),
-		AuthorityID: "authority:test", Scope: []string{"publication.withdraw"}}, authorityKey)
+		AuthorityID: "authority:test", Scope: []string{"publication.withdraw"}}, authorityKey.signer, authorityKey.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +380,7 @@ func withdrawalAction(t *testing.T, store *Store, withdrawal commerce.SignedAgen
 	action, err := commerce.BuildAuthorizedAction("owner:test", withdrawal.Body.IssuerAgentID, "publication.withdraw", fields,
 		canonical, fence, 1, "sha256:"+strings.Repeat("1", 64), "", "published", withdrawal.Body.ExpiresAtUnix)
 	if err == nil {
-		action, err = commerce.SignAuthorizedAction(action, authorityKey)
+		action, err = commerce.SignAuthorizedAction(context.Background(), action, authorityKey.keyID, authorityKey.signer, authorityKey.controller)
 	}
 	if err != nil {
 		t.Fatal(err)
