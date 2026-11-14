@@ -267,10 +267,17 @@ func (l *Limiter) Wrap(next http.Handler) http.Handler {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(l.bodyTimeout)); err != nil &&
-			!errors.Is(err, http.ErrNotSupported) {
-			http.Error(w, "request deadline unavailable", http.StatusInternalServerError)
-			return
+		// An empty body has nothing to deliver. For it the server already runs
+		// its background connection read, which a read deadline would turn
+		// into a cancelled request context once the deadline passes, so a
+		// slow handler would be aborted. Non-empty bodies clear the deadline
+		// themselves when the server reaches their end.
+		if r.Body != http.NoBody {
+			if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(l.bodyTimeout)); err != nil &&
+				!errors.Is(err, http.ErrNotSupported) {
+				http.Error(w, "request deadline unavailable", http.StatusInternalServerError)
+				return
+			}
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBytes)
 		next.ServeHTTP(w, r)

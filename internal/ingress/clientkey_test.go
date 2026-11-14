@@ -111,6 +111,30 @@ func TestWrapHintsShortRetryForGlobalSaturation(t *testing.T) {
 	}
 }
 
+func TestWrapLetsEmptyBodyRequestsOutliveTheBodyDeadline(t *testing.T) {
+	limiter, _ := newTestLimiter(t, DefaultLimits())
+	limiter.bodyTimeout = 100 * time.Millisecond
+	outcome := make(chan error, 1)
+	server := httptest.NewServer(limiter.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(400 * time.Millisecond):
+			outcome <- nil
+			w.WriteHeader(http.StatusNoContent)
+		case <-r.Context().Done():
+			outcome <- r.Context().Err()
+		}
+	})))
+	defer server.Close()
+	response, err := server.Client().Post(server.URL, "application/proto", http.NoBody)
+	if err != nil {
+		t.Fatalf("empty-body request failed: %v", err)
+	}
+	response.Body.Close()
+	if err := <-outcome; err != nil {
+		t.Fatalf("an empty-body request was cancelled by the body read deadline: %v", err)
+	}
+}
+
 func TestWrapCutsOffSlowBodies(t *testing.T) {
 	limiter, _ := newTestLimiter(t, DefaultLimits())
 	limiter.bodyTimeout = 200 * time.Millisecond
