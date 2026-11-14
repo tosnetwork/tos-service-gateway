@@ -35,7 +35,7 @@ canonical state without a valid signed Native action accepted by TOS.
 
 ## Run locally
 
-The module uses Go 1.26.5. Start a configured Native-only `tos-service-protocol` RPC
+The module uses Go 1.26.11. Start a configured Native-only `tos-service-protocol` RPC
 server, then run:
 
 ```bash
