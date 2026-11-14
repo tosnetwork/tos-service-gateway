@@ -1,6 +1,6 @@
 module github.com/tosnetwork/tos-service-gateway
 
-go 1.26.5
+go 1.26.11
 
 require (
 	connectrpc.com/connect v1.19.1
