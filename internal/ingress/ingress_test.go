@@ -27,9 +27,17 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
+func tryAcquire(limiter *Limiter, client string) (func(), bool) {
+	release, outcome := limiter.acquire(client)
+	return release, outcome == admitted
+}
+
 func newTestLimiter(t *testing.T, limits Limits) (*Limiter, *fakeClock) {
 	t.Helper()
 	clock := &fakeClock{now: time.Unix(1_800_000_000, 0)}
+	if limits.ClientAddressHeader == "" {
+		limits.ClientAddressHeader = HeaderNone
+	}
 	limiter, err := NewLimiter(limits, clock.Now)
 	if err != nil {
 		t.Fatalf("NewLimiter: %v", err)
@@ -47,6 +55,8 @@ func TestNewLimiterRejectsInvalidLimits(t *testing.T) {
 		"zero max clients":       func(l *Limits) { l.MaxClients = 0 },
 		"negative global":        func(l *Limits) { l.GlobalConcurrent = -1 },
 		"client above global":    func(l *Limits) { l.ClientConcurrent = l.GlobalConcurrent + 1 },
+		"empty address header":   func(l *Limits) { l.ClientAddressHeader = "" },
+		"unknown address header": func(l *Limits) { l.ClientAddressHeader = "Forwarded" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -66,22 +76,22 @@ func TestLimiterEnforcesPerClientRateAndResetsAfterWindow(t *testing.T) {
 	limiter, clock := newTestLimiter(t, Limits{GlobalConcurrent: 8, ClientConcurrent: 8,
 		ClientRequestsPerWindow: 3, Window: time.Minute, MaxClients: 16})
 	for i := 0; i < 3; i++ {
-		release, ok := limiter.acquire("a")
+		release, ok := tryAcquire(limiter, "a")
 		if !ok {
 			t.Fatalf("request %d refused within rate", i)
 		}
 		release()
 	}
-	if _, ok := limiter.acquire("a"); ok {
+	if _, ok := tryAcquire(limiter, "a"); ok {
 		t.Fatal("request above the per-window rate was admitted")
 	}
-	if release, ok := limiter.acquire("b"); !ok {
+	if release, ok := tryAcquire(limiter, "b"); !ok {
 		t.Fatal("another client was refused because of client a's rate")
 	} else {
 		release()
 	}
 	clock.Advance(time.Minute)
-	if release, ok := limiter.acquire("a"); !ok {
+	if release, ok := tryAcquire(limiter, "a"); !ok {
 		t.Fatal("request refused after the window expired")
 	} else {
 		release()
@@ -91,13 +101,13 @@ func TestLimiterEnforcesPerClientRateAndResetsAfterWindow(t *testing.T) {
 func TestLimiterTreatsBackwardClockAsNewWindow(t *testing.T) {
 	limiter, clock := newTestLimiter(t, Limits{GlobalConcurrent: 4, ClientConcurrent: 4,
 		ClientRequestsPerWindow: 1, Window: time.Minute, MaxClients: 4})
-	release, ok := limiter.acquire("a")
+	release, ok := tryAcquire(limiter, "a")
 	if !ok {
 		t.Fatal("first request refused")
 	}
 	release()
 	clock.Advance(-time.Hour)
-	if release, ok := limiter.acquire("a"); !ok {
+	if release, ok := tryAcquire(limiter, "a"); !ok {
 		t.Fatal("a clock step backwards must not lock the client out until the clock catches up")
 	} else {
 		release()
@@ -107,16 +117,16 @@ func TestLimiterTreatsBackwardClockAsNewWindow(t *testing.T) {
 func TestLimiterEnforcesPerClientConcurrency(t *testing.T) {
 	limiter, _ := newTestLimiter(t, Limits{GlobalConcurrent: 8, ClientConcurrent: 2,
 		ClientRequestsPerWindow: 100, Window: time.Minute, MaxClients: 16})
-	first, ok1 := limiter.acquire("a")
-	second, ok2 := limiter.acquire("a")
+	first, ok1 := tryAcquire(limiter, "a")
+	second, ok2 := tryAcquire(limiter, "a")
 	if !ok1 || !ok2 {
 		t.Fatal("requests within client concurrency refused")
 	}
-	if _, ok := limiter.acquire("a"); ok {
+	if _, ok := tryAcquire(limiter, "a"); ok {
 		t.Fatal("request above per-client concurrency admitted")
 	}
 	first()
-	third, ok := limiter.acquire("a")
+	third, ok := tryAcquire(limiter, "a")
 	if !ok {
 		t.Fatal("request refused after a slot was released")
 	}
@@ -127,16 +137,16 @@ func TestLimiterEnforcesPerClientConcurrency(t *testing.T) {
 func TestLimiterEnforcesGlobalConcurrency(t *testing.T) {
 	limiter, _ := newTestLimiter(t, Limits{GlobalConcurrent: 2, ClientConcurrent: 2,
 		ClientRequestsPerWindow: 100, Window: time.Minute, MaxClients: 16})
-	first, ok1 := limiter.acquire("a")
-	second, ok2 := limiter.acquire("b")
+	first, ok1 := tryAcquire(limiter, "a")
+	second, ok2 := tryAcquire(limiter, "b")
 	if !ok1 || !ok2 {
 		t.Fatal("requests within global concurrency refused")
 	}
-	if _, ok := limiter.acquire("c"); ok {
+	if _, ok := tryAcquire(limiter, "c"); ok {
 		t.Fatal("request above global concurrency admitted")
 	}
 	first()
-	third, ok := limiter.acquire("c")
+	third, ok := tryAcquire(limiter, "c")
 	if !ok {
 		t.Fatal("request refused after a global slot was released")
 	}
@@ -144,50 +154,81 @@ func TestLimiterEnforcesGlobalConcurrency(t *testing.T) {
 	third()
 }
 
-func TestLimiterRefusesNewClientsWhenTableIsFull(t *testing.T) {
+func TestLimiterSharesOverflowBucketWhenTableIsFull(t *testing.T) {
 	limiter, clock := newTestLimiter(t, Limits{GlobalConcurrent: 8, ClientConcurrent: 2,
-		ClientRequestsPerWindow: 100, Window: time.Minute, MaxClients: 2})
-	held, ok := limiter.acquire("a")
+		ClientRequestsPerWindow: 2, Window: time.Minute, MaxClients: 2})
+	held, ok := tryAcquire(limiter, "a")
 	if !ok {
 		t.Fatal("first client refused")
 	}
-	release, ok := limiter.acquire("b")
+	release, ok := tryAcquire(limiter, "b")
 	if !ok {
 		t.Fatal("second client refused")
 	}
 	release()
-	if _, ok := limiter.acquire("c"); ok {
-		t.Fatal("a new client was admitted while the table is full of live windows")
+	// The table is full of live windows: new clients are served from one
+	// shared overflow allowance instead of being refused or tracked.
+	for _, client := range []string{"c", "d"} {
+		release, ok := tryAcquire(limiter, client)
+		if !ok {
+			t.Fatalf("client %s refused while the overflow bucket has allowance", client)
+		}
+		release()
 	}
-	if len(limiter.clients) != 2 {
-		t.Fatalf("client table grew to %d entries", len(limiter.clients))
+	if _, ok := tryAcquire(limiter, "e"); ok {
+		t.Fatal("the overflow bucket exceeded its per-window allowance")
+	}
+	if limiter.trackedLocked() != 2 {
+		t.Fatalf("individually tracked clients grew to %d", limiter.trackedLocked())
+	}
+	if _, tracked := limiter.clients["c"]; tracked {
+		t.Fatal("an overflow client was tracked individually")
 	}
 	clock.Advance(time.Minute)
-	release, ok = limiter.acquire("c")
+	release, ok = tryAcquire(limiter, "c")
 	if !ok {
 		t.Fatal("new client refused after an idle window expired")
 	}
 	release()
+	if _, tracked := limiter.clients["c"]; !tracked {
+		t.Fatal("a client arriving after eviction was not tracked individually")
+	}
 	if _, tracked := limiter.clients["a"]; !tracked {
 		t.Fatal("a client with a request in flight was evicted")
 	}
 	held()
 }
 
+func TestLimiterReportsGlobalRefusalSeparately(t *testing.T) {
+	limiter, _ := newTestLimiter(t, Limits{GlobalConcurrent: 1, ClientConcurrent: 1,
+		ClientRequestsPerWindow: 1, Window: time.Minute, MaxClients: 4})
+	held, outcome := limiter.acquire("a")
+	if outcome != admitted {
+		t.Fatal("first request refused")
+	}
+	if _, outcome := limiter.acquire("b"); outcome != refusedGlobal {
+		t.Fatalf("global saturation reported as %d", outcome)
+	}
+	held()
+	if _, outcome := limiter.acquire("a"); outcome != refusedClient {
+		t.Fatalf("per-client exhaustion reported as %d", outcome)
+	}
+}
+
 func TestLimiterReleaseIsIdempotent(t *testing.T) {
 	limiter, _ := newTestLimiter(t, Limits{GlobalConcurrent: 1, ClientConcurrent: 1,
 		ClientRequestsPerWindow: 100, Window: time.Minute, MaxClients: 4})
-	release, ok := limiter.acquire("a")
+	release, ok := tryAcquire(limiter, "a")
 	if !ok {
 		t.Fatal("request refused")
 	}
 	release()
 	release()
-	held, ok := limiter.acquire("b")
+	held, ok := tryAcquire(limiter, "b")
 	if !ok {
 		t.Fatal("request refused after release")
 	}
-	if _, ok := limiter.acquire("c"); ok {
+	if _, ok := tryAcquire(limiter, "c"); ok {
 		t.Fatal("a repeated release freed a global slot it did not hold")
 	}
 	held()
@@ -202,7 +243,7 @@ func TestLimiterConcurrentUseKeepsCountsBalanced(t *testing.T) {
 		go func(client string) {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				if release, ok := limiter.acquire(client); ok {
+				if release, ok := tryAcquire(limiter, client); ok {
 					release()
 				}
 			}

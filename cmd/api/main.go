@@ -80,7 +80,7 @@ func main() {
 		Authorizer: nativegateway.NewTokenAuthorizer(cfg.NativeReadToken, cfg.NativeRelayToken),
 		Backend:    backend, Catalog: catalog, QuoteSource: quoteSource, Network: network,
 	}
-	limiter, err := ingress.NewLimiter(ingress.DefaultLimits(), nil)
+	limiter, err := ingress.NewLimiter(cfg.Ingress, nil)
 	if err != nil {
 		logger.Error("configure public ingress limits", "error", err)
 		os.Exit(2)

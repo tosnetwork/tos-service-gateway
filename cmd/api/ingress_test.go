@@ -69,7 +69,7 @@ func TestPublicConnectRejectsMessagesAboveAdvertisedLimit(t *testing.T) {
 
 func TestPublicConnectRateLimitsEveryService(t *testing.T) {
 	server, httpServer := newPublicConnectTestServer(t, ingress.Limits{GlobalConcurrent: 4, ClientConcurrent: 4,
-		ClientRequestsPerWindow: 1, Window: time.Hour, MaxClients: 4})
+		ClientRequestsPerWindow: 1, Window: time.Hour, MaxClients: 4, ClientAddressHeader: ingress.HeaderXForwardedFor})
 	discovery := tosservicev1connect.NewCapabilityDiscoveryServiceClient(httpServer.Client(), httpServer.URL)
 	request := connect.NewRequest(&nativev1.PublishSoftwareWorkManifestRequest{})
 	if _, err := discovery.PublishSoftwareWorkManifest(context.Background(), request); err != nil {

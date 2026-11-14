@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tosnetwork/tos-service-gateway/internal/ingress"
 	"github.com/tosnetwork/tos-service-gateway/internal/intentcarrier"
 )
 
@@ -37,6 +38,8 @@ type Config struct {
 	IntentCarrier     IntentCarrierConfig
 	CapabilityCarrier CapabilityCarrierConfig
 	QuoteProfileFile  string
+	// Ingress bounds the public Connect services.
+	Ingress ingress.Limits
 }
 
 type CapabilityCarrierConfig struct {
@@ -91,7 +94,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	limits, err := ingressLimitsFromEnv()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
+		Ingress:          limits,
 		Addr:             envOr("TOS_SERVICE_ADDR", "127.0.0.1:8080"),
 		PublicBaseURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("TOS_SERVICE_PUBLIC_BASE_URL")), "/"),
 		NativeReadToken:  strings.TrimSpace(os.Getenv("TOS_SERVICE_READ_TOKEN")),
@@ -256,6 +264,32 @@ func parseAuthorityPins(value string) (map[string]intentcarrier.PinnedAuthority,
 		return nil, fmt.Errorf("TOS_SERVICE_INTENT_AUTHORITY_PINS is invalid: %w", err)
 	}
 	return pins, nil
+}
+
+// ingressLimitsFromEnv reads the public Connect ingress limits. Every override
+// is bounded so a typo cannot disable a limit or exhaust memory.
+func ingressLimitsFromEnv() (ingress.Limits, error) {
+	limits := ingress.DefaultLimits()
+	global, err := intEnv("TOS_SERVICE_INGRESS_GLOBAL_CONCURRENT", limits.GlobalConcurrent)
+	if err != nil || global < 1 || global > 10_000 {
+		return ingress.Limits{}, errors.New("TOS_SERVICE_INGRESS_GLOBAL_CONCURRENT must be between 1 and 10000")
+	}
+	client, err := intEnv("TOS_SERVICE_INGRESS_CLIENT_CONCURRENT", limits.ClientConcurrent)
+	if err != nil || client < 1 || client > global {
+		return ingress.Limits{}, errors.New("TOS_SERVICE_INGRESS_CLIENT_CONCURRENT must be between 1 and the global concurrency")
+	}
+	perMinute, err := intEnv("TOS_SERVICE_INGRESS_CLIENT_REQUESTS_PER_MINUTE", limits.ClientRequestsPerWindow)
+	if err != nil || perMinute < 1 || perMinute > 1_000_000 {
+		return ingress.Limits{}, errors.New("TOS_SERVICE_INGRESS_CLIENT_REQUESTS_PER_MINUTE must be between 1 and 1000000")
+	}
+	header := envOr("TOS_SERVICE_CLIENT_ADDRESS_HEADER", limits.ClientAddressHeader)
+	if !ingress.ValidClientAddressHeader(header) {
+		return ingress.Limits{}, fmt.Errorf("TOS_SERVICE_CLIENT_ADDRESS_HEADER must be one of %s, %s, %s or %s",
+			ingress.HeaderXForwardedFor, ingress.HeaderXRealIP, ingress.HeaderCFConnectingIP, ingress.HeaderNone)
+	}
+	limits.GlobalConcurrent, limits.ClientConcurrent, limits.ClientRequestsPerWindow = global, client, perMinute
+	limits.ClientAddressHeader = header
+	return limits, limits.Validate()
 }
 
 func envOr(name, fallback string) string {
