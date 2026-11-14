@@ -15,6 +15,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/tosnetwork/tos-service-gateway/internal/adapters/serviceprotocol"
 	"github.com/tosnetwork/tos-service-gateway/internal/config"
+	"github.com/tosnetwork/tos-service-gateway/internal/ingress"
 	"github.com/tosnetwork/tos-service-gateway/internal/intentcarrier"
 	"github.com/tosnetwork/tos-service-gateway/internal/nativegateway"
 	"github.com/tosnetwork/tos-service-gateway/internal/quotesource"
@@ -79,13 +80,13 @@ func main() {
 		Authorizer: nativegateway.NewTokenAuthorizer(cfg.NativeReadToken, cfg.NativeRelayToken),
 		Backend:    backend, Catalog: catalog, QuoteSource: quoteSource, Network: network,
 	}
+	limiter, err := ingress.NewLimiter(cfg.Ingress, nil)
+	if err != nil {
+		logger.Error("configure public ingress limits", "error", err)
+		os.Exit(2)
+	}
 	mux := http.NewServeMux()
-	path, handler := tosservicev1connect.NewNativeServiceHandler(gateway)
-	mux.Handle(path, handler)
-	dnsPath, dnsHandler := tosservicev1connect.NewDNSAliasServiceHandler(gateway)
-	mux.Handle(dnsPath, dnsHandler)
-	discoveryPath, discoveryHandler := tosservicev1connect.NewCapabilityDiscoveryServiceHandler(gateway)
-	mux.Handle(discoveryPath, discoveryHandler)
+	registerPublicConnect(mux, gateway, limiter)
 	if cfg.IntentCarrier.Directory != "" {
 		verifier, verifierErr := mldsa44.NewTosctl(mldsa44.TosctlConfig{Binary: cfg.IntentCarrier.TosctlBinary,
 			SHA256: cfg.IntentCarrier.TosctlSHA256})
@@ -175,6 +176,24 @@ func main() {
 	}
 }
 
+// publicConnectServer is every public Connect service the gateway serves.
+type publicConnectServer interface {
+	tosservicev1connect.NativeServiceHandler
+	tosservicev1connect.DNSAliasServiceHandler
+	tosservicev1connect.CapabilityDiscoveryServiceHandler
+}
+
+// registerPublicConnect mounts the public Connect services behind the ingress
+// limiter, with the decoded message bounded to the advertised request size.
+func registerPublicConnect(mux *http.ServeMux, server publicConnectServer, limiter *ingress.Limiter) {
+	path, handler := tosservicev1connect.NewNativeServiceHandler(server, ingress.HandlerOptions()...)
+	mux.Handle(path, limiter.Wrap(handler))
+	dnsPath, dnsHandler := tosservicev1connect.NewDNSAliasServiceHandler(server, ingress.HandlerOptions()...)
+	mux.Handle(dnsPath, limiter.Wrap(dnsHandler))
+	discoveryPath, discoveryHandler := tosservicev1connect.NewCapabilityDiscoveryServiceHandler(server, ingress.HandlerOptions()...)
+	mux.Handle(discoveryPath, limiter.Wrap(discoveryHandler))
+}
+
 type gatewayDiscoveryDocument struct {
 	Schema           string                   `json:"schema"`
 	Protocol         string                   `json:"protocol"`
@@ -207,7 +226,7 @@ func gatewayDiscoveryHandler(cfg config.Config, now func() time.Time) http.Handl
 			Network:          gatewayDiscoveryNetwork{cfg.Catalog.NetworkID, cfg.Catalog.GenesisRootHash, cfg.Catalog.GenesisFileHash},
 			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{NativeConnect: cfg.PublicBaseURL, DNSConnect: cfg.PublicBaseURL,
 				IntentHTTP: intentServiceURL(cfg), CapabilityHTTP: capabilityServiceURL(cfg)},
-			Limits:    gatewayDiscoveryLimits{MaxRequestBytes: 1 << 20, MaxResponseBytes: cfg.TOSRPC.MaxMessageBytes},
+			Limits:    gatewayDiscoveryLimits{MaxRequestBytes: ingress.MaxRequestBytes, MaxResponseBytes: cfg.TOSRPC.MaxMessageBytes},
 			ExpiresAt: now().Add(time.Hour).Unix()}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "public, max-age=3600")

@@ -59,6 +59,31 @@ export TOS_SERVICE_PROVIDER_QUOTE_PROFILE_FILE='/absolute/private/provider/quote
 GOWORK=off go run ./cmd/api
 ```
 
+### Public ingress limits
+
+The Native, DNS alias and Capability discovery Connect services accept at most
+1 MiB per request (raw body and decoded message; the same value is advertised
+as `max_request_bytes`) and must receive the body within 10 seconds. One limiter
+shared by all three services bounds requests in flight globally and, per
+client, requests in flight and requests per minute. Refused requests get HTTP
+429 with `Retry-After` (1 second for global saturation, the window otherwise).
+
+Clients are identified behind the TLS terminator by the header it sets. The
+header is trusted only when the connecting peer is loopback, and for
+`X-Forwarded-For` only its right-most entry (the one the terminator appended) is
+used; configure the terminator to overwrite or append it, never to pass a
+client-supplied value through unchecked. IPv6 clients are grouped by /64. When
+the header is missing or malformed the peer address is used, which puts every
+such request in one shared bucket.
+
+```bash
+# X-Forwarded-For (default), X-Real-IP, CF-Connecting-IP, or none
+export TOS_SERVICE_CLIENT_ADDRESS_HEADER='X-Forwarded-For'
+export TOS_SERVICE_INGRESS_GLOBAL_CONCURRENT=64          # 1..10000
+export TOS_SERVICE_INGRESS_CLIENT_CONCURRENT=8           # 1..global
+export TOS_SERVICE_INGRESS_CLIENT_REQUESTS_PER_MINUTE=600 # 1..1000000
+```
+
 The Quote profile schema is illustrated in
 [`docs/provider-quote-profile.example.json`](docs/provider-quote-profile.example.json).
 It binds the provider Agent, the canonical manifest file, the transport policy,
